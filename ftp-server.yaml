@@ -1,0 +1,192 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: S3 bucket as FTP server
+
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instance
+    Type: 'AWS::EC2::KeyPair::KeyName'
+    Default: s3ftpserver
+    ConstraintDescription: must be the name of the existing EC2 Keypair
+  InstanceType:
+    Description: Webserver EC2 Instance Type
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+      - t1.micro
+      - t2.nano
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - t2.large
+    ConstraintDescription: must be a valid EC2 instance type
+  S3BucketNameForFileImport:
+    Type: String
+    Description: S3 bucket that will be mounted to the FTP server
+    Default: my-cool-ftp-s3-server-dev
+
+Resources:
+  FTPServer:
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      ImageId: ami-07f1fbbff759e24dd
+      InstanceType: 
+        Ref: InstanceType
+      Monitoring: 'true'
+      IamInstanceProfile: S3FTPServerInstanceProfile
+      SecurityGroups:
+        - Ref: WebSecurityGroup
+      KeyName:
+        Ref: KeyName
+      Tags:
+        - Key: Name
+          Value: FTPS3Server
+      UserData: 
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          echo "adding users for the ftp server"
+          adduser "username" && echo 'username:password' | chpasswd
+          mkdir -p /home/username/ftp
+          chown username:username /home/username/ftp
+          echo "starting ftp server configuration"
+          yum -y install vsftpd
+          PIP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
+          echo "anonymous_enable=NO" > /etc/vsftpd/vsftpd.conf
+          echo "local_enable=YES" >> /etc/vsftpd/vsftpd.conf 
+          echo "write_enable=YES" >> /etc/vsftpd/vsftpd.conf 
+          echo "chroot_local_user=YES" >> /etc/vsftpd/vsftpd.conf
+          echo 'user_sub_token=$USER' >> /etc/vsftpd/vsftpd.conf
+          echo 'local_root=/home/$USER/ftp' >> /etc/vsftpd/vsftpd.conf
+          echo "pasv_address=$PIP" >> /etc/vsftpd/vsftpd.conf
+          echo "userlist_enable=YES" >> /etc/vsftpd/vsftpd.conf
+          echo "userlist_file=/etc/vsftpd.userlist" >> /etc/vsftpd/vsftpd.conf
+          echo "userlist_deny=NO" >> /etc/vsftpd/vsftpd.conf
+          echo "anonymous_enable=NO" >> /etc/vsftpd/vsftpd.conf
+          echo "local_enable=YES" >> /etc/vsftpd/vsftpd.conf
+          echo "write_enable=YES" >> /etc/vsftpd/vsftpd.conf
+          echo "local_umask=022" >> /etc/vsftpd/vsftpd.conf
+          echo "dirmessage_enable=YES" >> /etc/vsftpd/vsftpd.conf
+          echo "xferlog_enable=YES" >> /etc/vsftpd/vsftpd.conf
+          echo "connect_from_port_20=YES" >> /etc/vsftpd/vsftpd.conf
+          echo "xferlog_std_format=YES" >> /etc/vsftpd/vsftpd.conf
+          echo "chroot_local_user=YES" >> /etc/vsftpd/vsftpd.conf
+          echo "listen=NO" >> /etc/vsftpd/vsftpd.conf
+          echo "listen_ipv6=YES" >> /etc/vsftpd/vsftpd.conf
+          echo "pam_service_name=vsftpd" >> /etc/vsftpd/vsftpd.conf
+          echo "userlist_enable=YES" >> /etc/vsftpd/vsftpd.conf
+          echo "tcp_wrappers=YES" >> /etc/vsftpd/vsftpd.conf
+          echo "pasv_enable=YES" >> /etc/vsftpd/vsftpd.conf
+          echo "pasv_min_port=1024" >> /etc/vsftpd/vsftpd.conf
+          echo "pasv_max_port=1048" >> /etc/vsftpd/vsftpd.conf
+          echo "allow_writeable_chroot=YES" >> /etc/vsftpd/vsftpd.conf
+          echo "username" | sudo tee -a /etc/vsftpd.userlist
+          systemctl restart vsftpd
+          echo "installing cronjob"
+          echo 'echo $(date)' > /home/s3sync.sh
+          echo 'echo "bucket sync process started..."' >> /home/s3sync.sh 
+          echo 'aws s3 sync /home/username/ftp s3://'"${S3FTPBucket}/" >> /home/s3sync.sh
+          echo 'echo "deleting uploaded files from the directory"' >> /home/s3sync.sh
+          echo 'rm -frd /home/username/ftp/*' >> /home/s3sync.sh
+          echo 'echo "downloading new files from remote bucket"' >> /home/s3sync.sh
+          echo 'aws s3 sync s3://'"${S3FTPBucket}/"' /home/username/ftp --delete' >> /home/s3sync.sh
+          echo 'echo "bucket sync process ended"' >> /home/s3sync.sh
+          chmod ugo+x /home/s3sync.sh
+          mkdir -p /home/bucket-logs
+          echo 'echo $(/home/s3sync.sh) >> /home/bucket-logs/$(date "+%Y-%m-%d").log' > /home/s3sync-cron.sh
+          chmod ugo+x /home/s3sync-cron.sh
+          echo '*/1 * * * * /home/s3sync-cron.sh > /dev/null 2>&1' | crontab -
+          "Installing packages finished"
+  FTPServerProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      InstanceProfileName: S3FTPServerInstanceProfile
+      Roles:
+        - S3FTPPolicy
+
+  BucketRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: S3FTPPolicy
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+
+  FTPUploadPolicy:
+    DependsOn:
+      - BucketRole
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: FtpS3Upload
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: "Allow"
+            Action: 
+              - s3:ListBucket
+            Resource: 
+              Fn::GetAtt:
+                - S3FTPBucket
+                - Arn
+          - Effect: Allow
+            Action:
+              s3:ListBucket
+            Resource: 
+              Fn::GetAtt:
+                - S3FTPBucket
+                - Arn
+          - Effect: Allow
+            Action:
+              "s3:*"
+            Resource: 
+              - Fn::GetAtt: [S3FTPBucket, Arn]
+              - Fn::Join:
+                  - ""
+                  - - Fn::GetAtt: [S3FTPBucket, Arn]
+      Roles:
+        - Ref: BucketRole
+
+  WebSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupName: S3FtpSecurityGroup
+      GroupDescription: Enable FTP and SSH access
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 1024
+          ToPort: 1048
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 20
+          ToPort: 21
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+  
+  S3FTPBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: 
+        Ref: S3BucketNameForFileImport
+
+Outputs:
+  PublicDNS:
+    Description: Ip address of the ftp server
+    Value:
+      Fn::GetAtt:
+        - FTPServer
+        - PublicDnsName
+  PublicIp:
+    Description: Public IP that will be used to connect to FTP
+    Value:
+      Fn::GetAtt:
+        - FTPServer
+        - PublicIp
